@@ -1,0 +1,15 @@
+# Telegram inbox. `allowedUsers` is required in practice: an empty list refuses
+# everyone, because an unset allow-list on an agent with shell access is a mistake
+# and the safe reading of it is "nobody".
+- insert:
+    - id: telegram-inbox
+      name: 'dsh-telegram-inbox'
+      config:
+        agentName: jarvis
+        tokenFile: /etc/dsh/telegram.token
+        appDir: /opt/agent/app
+        workspace: /opt/agent/work
+        allowedUsers: [123456789]
+        # offsetFile makes a restart quiet: without it Telegram replays its
+        # ~24h backlog of unconfirmed updates to the next getUpdates.
+        offsetFile: /var/lib/dsh/telegram-offset.json

@@ -1,0 +1,13 @@
+{
+  "name": "dsh-telegram-inbox",
+  "version": "0.1.0",
+  "description": "Telegram inbox for the DeepSeek Harness: one chat is one durable agent session, with a fail-closed allow-list and a poll loop that never blocks on I/O.",
+  "license": "MIT",
+  "type": "module",
+  "exports": { ".": "./src/index.js" },
+  "files": ["src", "cordis.patch.yml", "README.md", "LICENSE"],
+  "scripts": { "test": "node --test test/*.test.js" },
+  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "telegram", "channel", "agent"],
+  "engines": { "node": ">=20" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}
