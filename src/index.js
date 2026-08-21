@@ -28,6 +28,8 @@ import { classify, buildContent, describeSkipped, MAX_IMAGE_BYTES } from './medi
 import { Albums } from './album.js';
 import { Generations } from './generations.js';
 import { Handoff } from './handoff.js';
+import { SessionLog } from './sessionLog.js';
+import { AutoHandoff } from './autoHandoff.js';
 import { createLogger } from './log.js';
 
 export const name = 'dsh-telegram-inbox';
@@ -142,6 +144,10 @@ export function apply(ctx, config = {}) {
     log,
   });
 
+  // Reads the stored log: one stat to notice that somebody wrote, a decode only when
+  // "is a turn running?" is about to decide something.
+  const logs = new SessionLog({ persistence: () => ctx.get('sessionPersistence'), log });
+
   // ── outbound: session events → Telegram ──────────────────────────────────
   const typingFor = new Map(); // chatKey -> interval, keeps the indicator alive
 
@@ -150,9 +156,39 @@ export function apply(ctx, config = {}) {
     if (t) { clearInterval(t); typingFor.delete(chatKey); }
   }
 
+  // Ownership follows whoever spoke last: a write from the web UI takes the chat away
+  // from the daemon, and the next Telegram message takes it back. See autoHandoff.js.
+  const auto = new AutoHandoff({
+    handoff,
+    logs,
+    log,
+    enabled: config.autoHandoff !== false,
+    quietMs: config.quietMs,
+    staleTurnMs: config.staleTurnMs,
+    liveSessions: () => [...sessions.bySession.keys()],
+    dropAgent: async (sessionId) => {
+      const chatKey = sessions.chatFor(sessionId);
+      if (chatKey === undefined) return false;
+      stopTyping(chatKey);
+      await sessions.forget(chatKey);
+      // What the daemon knows about the session outlives the agent on purpose: it is how
+      // long the other side has been active, and letting go of the chat is not a reason to
+      // stop watching it.
+      return true;
+    },
+    deliver: async (sessionId, message) => {
+      const chatKey = message?.chatKey ?? sessions.chatFor(sessionId);
+      if (chatKey === undefined) { log.warn(`a parked message for ${sessionId} has no chat`); return; }
+      await deliver(chatKey, message.content);
+    },
+  });
+
   ctx.on('session/event', (session, event) => {
     const chatKey = sessions.chatFor(session?.id ?? '');
     if (chatKey === undefined) return;
+    // Every event this process writes passes through here, which is how the daemon tells
+    // its own appends from somebody else's rather than handing the chat over to nobody.
+    auto.noteEvent(session.id, event);
     const chatId = Number(chatKey);
     try {
       if (event.type === 'turn/start') {
@@ -233,7 +269,12 @@ export function apply(ctx, config = {}) {
 
   // ── inbound ──────────────────────────────────────────────────────────────
   async function deliver(chatKey, content) {
-    const { handle } = await buildAgent(chatKey);
+    // Taking an agent for a chat is also the moment to take a baseline of its log: a
+    // resume can append events this process never sees as events, and without the
+    // baseline those read as somebody else's writing on the very next poll.
+    const fresh = !sessions.byChat.has(chatKey);
+    const { handle, sessionId } = await buildAgent(chatKey);
+    if (fresh) await auto.watch(sessionId);
     // A message sent while the agent is still replaying its log is dropped, so wait
     // for idle — but with a ceiling, since whenIdle() is not obliged to settle.
     await Promise.race([
@@ -347,6 +388,7 @@ export function apply(ctx, config = {}) {
       return;
     }
     if (text === '/new') {
+      auto.forget(generations.sessionId('telegram', chatKey));
       await sessions.forget(chatKey);
       const g = generations.bump(chatKey);
       const fresh = generations.sessionId('telegram', chatKey);
@@ -356,67 +398,39 @@ export function apply(ctx, config = {}) {
       return;
     }
     if (text === '/status') {
+      const held = handoff.claimOf(generations.sessionId('telegram', chatKey));
       await tg.send(chatId,
         `chats held: ${sessions.byChat.size}\n` +
         `this chat: ${sessions.byChat.has(chatKey) ? sessions.byChat.get(chatKey).sessionId : 'not loaded'}\n` +
+        `owner: ${held ? held.owner : 'this bot'}\n` +
         `update offset: ${tg.offset}`, splitMessage);
       return;
     }
 
     const sessionId = generations.sessionId('telegram', chatKey);
-    const claim = handoff.claimOf(sessionId);
-    if (claim) {
-      handoff.park(sessionId, { chatKey, content: content ?? [{ type: 'text', text }], at: Date.now() });
-      log.info(`parked a message for ${sessionId}: held by ${claim.owner}`);
-      await tg.send(chatId,
-        `This conversation is open in ${claim.owner} right now. Your message is saved and I'll `
-        + 'answer it as soon as it is released.', splitMessage).catch(() => {});
-      return;
-    }
+    const message = { chatKey, content: content ?? [{ type: 'text', text }], at: Date.now() };
 
     try {
-      await deliver(chatKey, content ?? [{ type: 'text', text }]);
+      const outcome = await auto.admit(sessionId, message);
+      if (outcome.parked) await tg.send(chatId, whyParked(outcome), splitMessage).catch(() => {});
     } catch (e) {
       log.error(`could not hand the message to an agent: ${e?.message ?? e}`);
       await tg.send(chatId, 'Could not hand your message to the agent — it is in the log.', splitMessage);
     }
   }
 
-  /**
-   * Honour handoff claims, and pick conversations back up when they are handed back.
-   *
-   * Two halves. A claimed session must lose its daemon-side agent — an agent holding the
-   * session writes to its log the moment anything wakes it, which is exactly the second
-   * writer the claim exists to prevent. Then the claim is stamped, so the client waiting to
-   * open the session learns we have let go instead of guessing from a timer. On release,
-   * whatever arrived meanwhile is replayed in order, because a message that is silently
-   * dropped is worse than one that is late.
-   */
-  async function serviceHandoffs() {
-    if (!config.handoffDir) return;
-
-    for (const claim of handoff.claims()) {
-      const chatKey = sessions.chatFor(claim.sessionId);
-      if (chatKey !== undefined) {
-        stopTyping(chatKey);
-        await sessions.forget(chatKey);
-        log.info(`releasing ${claim.sessionId} to ${claim.owner}`);
-      }
-      // Stamped whether or not we held it: "nothing to release" is still a handover.
-      if (!claim.ackedAt) handoff.ack(claim.sessionId);
+  /** Say why a message is waiting. A message held in silence looks exactly like a lost one. */
+  function whyParked({ reason, owner }) {
+    if (reason === 'turn') {
+      return 'A turn is still running in this conversation, so I have queued your message and '
+           + 'will answer it the moment that turn ends.';
     }
-
-    for (const sessionId of handoff.releasedWithPending()) {
-      const queue = handoff.drain(sessionId);
-      if (!queue.length) continue;
-      log.info(`replaying ${queue.length} parked message(s) for ${sessionId}`);
-      for (const msg of queue) {
-        const chatKey = msg.chatKey ?? sessions.chatFor(sessionId);
-        if (chatKey === undefined) { log.warn(`parked message for ${sessionId} has no chat`); continue; }
-        try { await deliver(chatKey, msg.content); }
-        catch (e) { log.error(`replaying a parked message for ${sessionId}: ${e?.message ?? e}`); }
-      }
+    if (reason === 'busy') {
+      return `${owner ?? 'Another client'} is still working in this conversation. Your message is `
+           + 'saved and I will answer it as soon as it goes quiet.';
     }
+    return `This conversation is open in ${owner ?? 'another client'} right now. Your message is `
+         + "saved and I'll answer it as soon as it is released.";
   }
 
   // ── poll loop, one per token ─────────────────────────────────────────────
@@ -424,7 +438,7 @@ export function apply(ctx, config = {}) {
     while (run.alive) {
       // Claims first: a handoff should take effect when the loop wakes, not only once
       // Telegram has something to say.
-      try { await serviceHandoffs(); } catch (e) { log.warn(`handoff check failed: ${e?.message ?? e}`); }
+      try { await auto.service(); } catch (e) { log.warn(`handoff check failed: ${e?.message ?? e}`); }
       try {
         const updates = await tg.poll(config.pollSeconds ?? 25);
         // Updates are handled sequentially on purpose: two turns for one chat racing
