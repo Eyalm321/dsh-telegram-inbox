@@ -24,6 +24,8 @@ import { AllowList, describeIntruder } from './allowlist.js';
 import { ChatSessions } from './sessions.js';
 import { splitMessage } from './chunk.js';
 import { transcribeVoice } from './voice.js';
+import { classify, buildContent, describeSkipped } from './media.js';
+import { Albums } from './album.js';
 import { createLogger } from './log.js';
 
 export const name = 'dsh-telegram-inbox';
@@ -117,6 +119,10 @@ export function apply(ctx, config = {}) {
     log: (lvl, m) => log(lvl, m),
     offsetFile: config.offsetFile || null,
   });
+
+  // Album members arrive as separate updates sharing a media_group_id; buffer them briefly
+  // so one user action becomes one turn.
+  const albums = new Albums({ graceMs: config.albumGraceMs });
 
   const sessions = new ChatSessions({
     agents: ctx.agents,
@@ -216,7 +222,7 @@ export function apply(ctx, config = {}) {
   }
 
   // ── inbound ──────────────────────────────────────────────────────────────
-  async function deliver(chatKey, text) {
+  async function deliver(chatKey, content) {
     const { handle } = await buildAgent(chatKey);
     // A message sent while the agent is still replaying its log is dropped, so wait
     // for idle — but with a ceiling, since whenIdle() is not obliged to settle.
@@ -225,39 +231,63 @@ export function apply(ctx, config = {}) {
       new Promise((r) => setTimeout(r, config.idleWaitMs ?? 15000)),
     ]);
     handle.agent.send(
-      platform.createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }),
+      platform.createUserMessage({ content, source: { kind: 'user' } }),
       'next-turn',
       true, // wake the driver; without it the message waits indefinitely
     );
     sessions.touch(chatKey);
-    log.info(`delivered ${text.length} chars to chat ${chatKey}`);
+    const chars = content.filter((b) => b.type === 'text').reduce((n, b) => n + b.text.length, 0);
+    const imgs = content.filter((b) => b.type === 'image').length;
+    log.info(`delivered ${chars} chars${imgs ? ` + ${imgs} image(s)` : ''} to chat ${chatKey}`);
+  }
+
+  /**
+   * Commit inbound images to the attachment service so the turn can reference them.
+   * Returns { attachments, skipped, why } — a failure here must degrade to caption-only,
+   * never to dropping the message.
+   */
+  async function attachImages(photos) {
+    const store = ctx.get('attachments');
+    if (!store?.saveImage) return { attachments: [], skipped: photos.length, why: 'no attachment service is composed' };
+    const attachments = [];
+    let why = '';
+    for (const p of photos) {
+      try {
+        const { bytes } = await tg.downloadFile(p.fileId);
+        attachments.push(await store.saveImage({ data: new Uint8Array(bytes), mediaType: p.mediaType, name: p.name }));
+      } catch (e) {
+        why = e?.message ?? String(e);
+        log.warn(`could not attach ${p.name}: ${why}`);
+      }
+    }
+    return { attachments, skipped: photos.length - attachments.length, why: why || 'unreadable' };
   }
 
   async function handleUpdate(update) {
     const msg = update.message;
-    const isVoice = Boolean(msg?.voice || msg?.audio);
-    if (!msg?.text && !isVoice) return;
-
+    if (!msg?.chat) return;
     const chatId = msg.chat.id;
     const chatKey = String(chatId);
     const userId = msg.from?.id;
+    const what = classify(msg);
 
     if (!allow.admits(userId)) {
       log.warn(`refused user ${userId} (@${msg.from?.username ?? '—'})`);
       if (allow.shouldAlert(userId)) {
-        const alert = describeIntruder(msg, msg.text ?? '[voice message]');
+        const alert = describeIntruder(msg, what.text || `[${what.kind}]`);
         for (const owner of allow.owners) {
           await tg.send(owner, alert, splitMessage)
             .catch((e) => log.error(`could not alert owner ${owner}: ${e?.message ?? e}`));
         }
       }
-      await tg.send(chatId, 'Sorry — you are not on the allow-list for this bot.', splitMessage)
-        .catch(() => {});
+      await tg.send(chatId, 'Sorry — you are not on the allow-list for this bot.', splitMessage).catch(() => {});
       return;
     }
 
-    let text;
-    if (isVoice) {
+    let text = what.text;
+    let content = null;
+
+    if (what.kind === 'voice') {
       void tg.typing(chatId);
       try {
         const transcript = await transcribeVoice(tg, (msg.voice ?? msg.audio).file_id, config.transcribeCommand);
@@ -272,13 +302,25 @@ export function apply(ctx, config = {}) {
         await tg.send(chatId, 'Could not transcribe that voice message. Please try again.', splitMessage);
         return;
       }
-    } else {
-      text = msg.text.trim();
+    } else if (what.kind === 'photo') {
+      void tg.typing(chatId);
+      const { attachments, skipped, why } = await attachImages(what.photos);
+      log.info(`received ${what.photos.length} image(s), attached ${attachments.length}`
+             + (what.text ? `, caption ${what.text.length} chars` : ', no caption'));
+      content = buildContent({ text: what.text, attachments, note: describeSkipped(skipped, why) });
+    } else if (what.kind === 'unsupported') {
+      // Never silent: the sender cannot tell a dropped message from a slow one.
+      log.warn(`ignored unsupported message type: ${what.unsupported}`);
+      await tg.send(chatId, `I can't read ${what.unsupported} yet — send text, a voice note, or an image.`, splitMessage);
+      return;
     }
+
+    if (!content && !text) return;
 
     if (text === '/start' || text === '/help') {
       await tg.send(chatId,
         'Agent online. Send a task as an ordinary message.\n' +
+        'Text, voice notes and images (with captions) all work.\n' +
         '/new — start a fresh conversation (history is kept on disk).\n' +
         '/status — what this bot is currently holding.', splitMessage);
       return;
@@ -297,7 +339,7 @@ export function apply(ctx, config = {}) {
     }
 
     try {
-      await deliver(chatKey, text);
+      await deliver(chatKey, content ?? [{ type: 'text', text }]);
     } catch (e) {
       log.error(`could not hand the message to an agent: ${e?.message ?? e}`);
       await tg.send(chatId, 'Could not hand your message to the agent — it is in the log.', splitMessage);
@@ -311,13 +353,17 @@ export function apply(ctx, config = {}) {
         const updates = await tg.poll(config.pollSeconds ?? 25);
         // Updates are handled sequentially on purpose: two turns for one chat racing
         // each other is worse than a queue.
-        for (const u of updates) {
+        const messages = albums.accept(updates.map((u) => u.message).filter(Boolean));
+        for (const msg of messages) {
           if (!run.alive) break;
-          try { await handleUpdate(u); }
-          catch (e) { log.error(`handling update ${u.update_id}: ${e?.message ?? e}`); }
+          try { await handleUpdate({ message: msg }); }
+          catch (e) { log.error(`handling message ${msg.message_id}: ${e?.message ?? e}`); }
         }
       } catch (e) {
         log.warn(`poll failed: ${e?.message ?? e}`);
+        for (const msg of albums.flush(true)) {
+          try { await handleUpdate({ message: msg }); } catch { /* reported below */ }
+        }
         await new Promise((r) => setTimeout(r, config.retryMs ?? 3000));
       }
     }
