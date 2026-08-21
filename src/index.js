@@ -27,6 +27,7 @@ import { transcribeVoice } from './voice.js';
 import { classify, buildContent, describeSkipped, MAX_IMAGE_BYTES } from './media.js';
 import { Albums } from './album.js';
 import { Generations } from './generations.js';
+import { Handoff } from './handoff.js';
 import { createLogger } from './log.js';
 
 export const name = 'dsh-telegram-inbox';
@@ -127,6 +128,11 @@ export function apply(ctx, config = {}) {
 
   // `/new` bumps a per-chat generation so the next message gets a genuinely new session.
   const generations = new Generations(config.generationsFile || null, { log });
+
+  // A conversation can be handed to another client (the web UI, the CLI). While claimed the
+  // daemon does not touch that session at all — one writer, always — and inbound messages are
+  // parked rather than dropped.
+  const handoff = new Handoff(config.handoffDir || null, { ttlMs: config.handoffTtlMs, log });
 
   const sessions = new ChatSessions({
     agents: ctx.agents,
@@ -357,6 +363,17 @@ export function apply(ctx, config = {}) {
       return;
     }
 
+    const sessionId = generations.sessionId('telegram', chatKey);
+    const claim = handoff.claimOf(sessionId);
+    if (claim) {
+      handoff.park(sessionId, { content: content ?? [{ type: 'text', text }], at: Date.now() });
+      log.info(`parked a message for ${sessionId}: held by ${claim.owner}`);
+      await tg.send(chatId,
+        `This conversation is open in ${claim.owner} right now. Your message is saved and I'll `
+        + 'answer it as soon as it is released.', splitMessage).catch(() => {});
+      return;
+    }
+
     try {
       await deliver(chatKey, content ?? [{ type: 'text', text }]);
     } catch (e) {
@@ -372,6 +389,7 @@ export function apply(ctx, config = {}) {
         const updates = await tg.poll(config.pollSeconds ?? 25);
         // Updates are handled sequentially on purpose: two turns for one chat racing
         // each other is worse than a queue.
+        await serviceHandoffs();
         const messages = albums.accept(updates.map((u) => u.message).filter(Boolean));
         for (const msg of messages) {
           if (!run.alive) break;
