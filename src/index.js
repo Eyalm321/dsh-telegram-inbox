@@ -24,7 +24,7 @@ import { AllowList, describeIntruder } from './allowlist.js';
 import { ChatSessions } from './sessions.js';
 import { splitMessage } from './chunk.js';
 import { transcribeVoice } from './voice.js';
-import { classify, buildContent, describeSkipped } from './media.js';
+import { classify, buildContent, describeSkipped, MAX_IMAGE_BYTES } from './media.js';
 import { Albums } from './album.js';
 import { Generations } from './generations.js';
 import { createLogger } from './log.js';
@@ -258,6 +258,11 @@ export function apply(ctx, config = {}) {
     for (const p of photos) {
       try {
         const { bytes } = await tg.downloadFile(p.fileId);
+        if (bytes.length > MAX_IMAGE_BYTES) {
+          why = `larger than the ${Math.round(MAX_IMAGE_BYTES / 1048576)}MB limit`;
+          log.warn(`skipping ${p.name}: ${bytes.length} bytes`);
+          continue;
+        }
         attachments.push(await store.saveImage({ data: new Uint8Array(bytes), mediaType: p.mediaType, name: p.name }));
       } catch (e) {
         why = e?.message ?? String(e);
@@ -309,9 +314,15 @@ export function apply(ctx, config = {}) {
     } else if (what.kind === 'photo') {
       void tg.typing(chatId);
       const { attachments, skipped, why } = await attachImages(what.photos);
+      const overflow = what.dropped
+        ? `[${what.dropped} further image(s) in this message were not read: only the first ${what.photos.length} are handled.]`
+        : '';
       log.info(`received ${what.photos.length} image(s), attached ${attachments.length}`
              + (what.text ? `, caption ${what.text.length} chars` : ', no caption'));
-      content = buildContent({ text: what.text, attachments, note: describeSkipped(skipped, why) });
+      content = buildContent({
+        text: what.text, attachments,
+        note: [describeSkipped(skipped, why), overflow].filter(Boolean).join('\n'),
+      });
     } else if (what.kind === 'unsupported') {
       // Never silent: the sender cannot tell a dropped message from a slow one.
       log.warn(`ignored unsupported message type: ${what.unsupported}`);

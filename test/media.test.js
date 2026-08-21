@@ -63,3 +63,18 @@ test('describeSkipped says nothing when nothing was skipped', () => {
   assert.equal(describeSkipped(0, 'x'), '');
   assert.match(describeSkipped(1, 'download failed'), /^\[image .* download failed\]$/);
 });
+
+test('an album beyond the cap is truncated, not refused', async () => {
+  const { MAX_IMAGES_PER_MESSAGE } = await import('../src/media.js');
+  const many = Array.from({ length: MAX_IMAGES_PER_MESSAGE + 3 }, (_, i) => ({ file_id: `f${i}` }));
+  const w = classify({ chat: { id: 1 }, album: many.length, caption: 'lots', photo: many });
+  assert.equal(w.photos.length, MAX_IMAGES_PER_MESSAGE);
+  assert.equal(w.dropped, 3, 'the caller must be able to say what was left out');
+  assert.equal(w.text, 'lots', 'the caption survives regardless');
+});
+
+test('an album within the cap drops nothing', () => {
+  const w = classify({ chat: { id: 1 }, album: 8, photo: Array.from({ length: 8 }, (_, i) => ({ file_id: `f${i}` })) });
+  assert.equal(w.photos.length, 8);
+  assert.equal(w.dropped, 0);
+});

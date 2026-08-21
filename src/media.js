@@ -10,6 +10,17 @@
  * @module dsh-telegram-inbox/media
  */
 
+/**
+ * Bounds on what will be pulled into memory.
+ *
+ * Not chosen from a memory scare: measured, a typical album of 8 phone photos is under
+ * 2 MB total and the daemon's footprint is dominated by the model client and MCP servers.
+ * These exist for the pathological case — Telegram allows 10 MB per photo and far more as
+ * a document, so an album of those is the only image path that could matter.
+ */
+export const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+export const MAX_IMAGES_PER_MESSAGE = 12;
+
 /** Telegram media types worth trying to read, in the order we prefer them. */
 export const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
@@ -45,7 +56,12 @@ export function classify(msg) {
       name: msg.document.file_name || 'image',
     });
   }
-  if (photos.length) return { kind: 'photo', text: caption, photos };
+  if (photos.length) {
+    // Truncate rather than refuse: nine of twelve pictures plus the caption is far more
+    // useful than an error, and the note tells the model what it is not seeing.
+    const dropped = Math.max(0, photos.length - MAX_IMAGES_PER_MESSAGE);
+    return { kind: 'photo', text: caption, photos: photos.slice(0, MAX_IMAGES_PER_MESSAGE), dropped };
+  }
 
   if (text) return { kind: 'text', text, photos: [] };
 
