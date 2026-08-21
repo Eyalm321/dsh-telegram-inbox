@@ -74,6 +74,23 @@ dsh plugin --profile <name> add dsh-telegram-inbox
 `/start`, `/help` — what the bot is. `/new` — start a fresh conversation (the old session stays
 on disk). `/status` — chats held, this chat's session id, current update offset.
 
+## What a resumed chat carries
+
+A session is durable, which means it also preserves facts about the process that created
+it. Two are corrected on every resume:
+
+- **Runtime-context snapshots.** `dsh-system-prompt` injects a "Current runtime context"
+  message describing the sandbox policy and workspace. The loop retains the latest, but
+  earlier ones stay in the transcript, so a resumed chat can show the model a policy from
+  a previous process. They are replaced via the surface-replacement mechanism the
+  compaction plugins use — the originals stay in the append-only log.
+- **The sandbox mode.** A session records its permission preset at creation, and
+  `sandbox-policy` resolves `explicit grant ?? fold(session events) ?? deployment
+  default`, so the session's own record outranks the deployment default. A chat created
+  before `DSH_PERMISSION_MODE` was set stays restricted forever otherwise. Realignment
+  runs only when that variable is set explicitly, and it downgrades as readily as it
+  upgrades.
+
 ## Notes
 
 - **Model routing matters.** If the composed default model is an agent-shaped provider that runs

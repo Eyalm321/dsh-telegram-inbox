@@ -13,6 +13,8 @@
  *
  * @module dsh-telegram-inbox/sessions
  */
+import { pruneStaleContext } from './staleContext.js';
+import { alignSandboxMode } from './sandboxMode.js';
 
 export class ChatSessions {
   /**
@@ -48,6 +50,14 @@ export class ChatSessions {
     if (persistence && await this.#onDisk(persistence, sessionId)) {
       try {
         handle = await resume(sessionId);
+        // A chat resumed from disk carries runtime-context snapshots describing previous
+        // processes — sandbox policy, cwd, model. Observed live: an agent read a stale
+        // `workspace-write` line and worked around a read-only filesystem that no longer
+        // existed. Drop them so it reads the world it is actually in.
+        pruneStaleContext(handle.agent?.session, { log: this.log });
+        // The session's own sandbox mode outranks the deployment default, so a chat
+        // created before the operator set DSH_PERMISSION_MODE would stay restricted.
+        alignSandboxMode(handle.agent?.session, process.env.DSH_PERMISSION_MODE, { log: this.log });
         this.log.info(`resumed session ${sessionId} (history preserved)`);
       } catch (e) {
         // Falling back to a fresh session loses history but keeps the bot answering,
