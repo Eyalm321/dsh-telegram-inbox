@@ -385,6 +385,9 @@ export function apply(ctx, config = {}) {
   // ── poll loop, one per token ─────────────────────────────────────────────
   async function loop(run) {
     while (run.alive) {
+      // Claims first: a handoff should take effect when the loop wakes, not only once
+      // Telegram has something to say.
+      try { await serviceHandoffs(); } catch (e) { log.warn(`handoff check failed: ${e?.message ?? e}`); }
       try {
         const updates = await tg.poll(config.pollSeconds ?? 25);
         // Updates are handled sequentially on purpose: two turns for one chat racing
