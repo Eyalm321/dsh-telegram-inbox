@@ -26,6 +26,7 @@ import { splitMessage } from './chunk.js';
 import { transcribeVoice } from './voice.js';
 import { classify, buildContent, describeSkipped } from './media.js';
 import { Albums } from './album.js';
+import { Generations } from './generations.js';
 import { createLogger } from './log.js';
 
 export const name = 'dsh-telegram-inbox';
@@ -124,9 +125,12 @@ export function apply(ctx, config = {}) {
   // so one user action becomes one turn.
   const albums = new Albums({ graceMs: config.albumGraceMs });
 
+  // `/new` bumps a per-chat generation so the next message gets a genuinely new session.
+  const generations = new Generations(config.generationsFile || null, { log });
+
   const sessions = new ChatSessions({
     agents: ctx.agents,
-    sessionId: (chatKey) => `telegram-${chatKey}`,
+    sessionId: (chatKey) => generations.sessionId('telegram', chatKey),
     idleMs: config.chatIdleMs,
     max: config.maxChats,
     log,
@@ -326,8 +330,12 @@ export function apply(ctx, config = {}) {
       return;
     }
     if (text === '/new') {
-      const had = await sessions.forget(chatKey);
-      await tg.send(chatId, had ? 'Started a new conversation.' : 'Nothing to reset.', splitMessage);
+      await sessions.forget(chatKey);
+      const g = generations.bump(chatKey);
+      const fresh = generations.sessionId('telegram', chatKey);
+      log.info(`reset chat ${chatKey} -> generation ${g} (${fresh})`);
+      await tg.send(chatId,
+        `Started a new conversation (${fresh}). The previous one is kept on disk.`, splitMessage);
       return;
     }
     if (text === '/status') {
