@@ -366,7 +366,7 @@ export function apply(ctx, config = {}) {
     const sessionId = generations.sessionId('telegram', chatKey);
     const claim = handoff.claimOf(sessionId);
     if (claim) {
-      handoff.park(sessionId, { content: content ?? [{ type: 'text', text }], at: Date.now() });
+      handoff.park(sessionId, { chatKey, content: content ?? [{ type: 'text', text }], at: Date.now() });
       log.info(`parked a message for ${sessionId}: held by ${claim.owner}`);
       await tg.send(chatId,
         `This conversation is open in ${claim.owner} right now. Your message is saved and I'll `
@@ -382,6 +382,43 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /**
+   * Honour handoff claims, and pick conversations back up when they are handed back.
+   *
+   * Two halves. A claimed session must lose its daemon-side agent — an agent holding the
+   * session writes to its log the moment anything wakes it, which is exactly the second
+   * writer the claim exists to prevent. Then the claim is stamped, so the client waiting to
+   * open the session learns we have let go instead of guessing from a timer. On release,
+   * whatever arrived meanwhile is replayed in order, because a message that is silently
+   * dropped is worse than one that is late.
+   */
+  async function serviceHandoffs() {
+    if (!config.handoffDir) return;
+
+    for (const claim of handoff.claims()) {
+      const chatKey = sessions.chatFor(claim.sessionId);
+      if (chatKey !== undefined) {
+        stopTyping(chatKey);
+        await sessions.forget(chatKey);
+        log.info(`releasing ${claim.sessionId} to ${claim.owner}`);
+      }
+      // Stamped whether or not we held it: "nothing to release" is still a handover.
+      if (!claim.ackedAt) handoff.ack(claim.sessionId);
+    }
+
+    for (const sessionId of handoff.releasedWithPending()) {
+      const queue = handoff.drain(sessionId);
+      if (!queue.length) continue;
+      log.info(`replaying ${queue.length} parked message(s) for ${sessionId}`);
+      for (const msg of queue) {
+        const chatKey = msg.chatKey ?? sessions.chatFor(sessionId);
+        if (chatKey === undefined) { log.warn(`parked message for ${sessionId} has no chat`); continue; }
+        try { await deliver(chatKey, msg.content); }
+        catch (e) { log.error(`replaying a parked message for ${sessionId}: ${e?.message ?? e}`); }
+      }
+    }
+  }
+
   // ── poll loop, one per token ─────────────────────────────────────────────
   async function loop(run) {
     while (run.alive) {
@@ -392,7 +429,6 @@ export function apply(ctx, config = {}) {
         const updates = await tg.poll(config.pollSeconds ?? 25);
         // Updates are handled sequentially on purpose: two turns for one chat racing
         // each other is worse than a queue.
-        await serviceHandoffs();
         const messages = albums.accept(updates.map((u) => u.message).filter(Boolean));
         for (const msg of messages) {
           if (!run.alive) break;

@@ -13,6 +13,11 @@
  * Claims expire. A client that crashes mid-handoff must not lock a conversation forever,
  * and the failure mode of a stale claim — the daemon takes over again — is the safe one.
  *
+ * Claiming is not the same as being handed over. The daemon may be mid-turn when the claim
+ * lands, so it stamps the claim with `ackedAt` once it has actually let go. A client that
+ * waits for that stamp knows it is alone with the session; one that waits a fixed number of
+ * seconds only knows that time has passed.
+ *
  * @module dsh-telegram-inbox/handoff
  */
 import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, unlinkSync, existsSync } from 'node:fs';
@@ -61,6 +66,24 @@ export class Handoff {
 
   isClaimed(sessionId) { return this.claimOf(sessionId) !== null; }
 
+  /**
+   * Record that the daemon has honoured a claim and is no longer touching the session.
+   * Idempotent: the first acknowledgement is the one that counts, so re-acking each poll
+   * does not keep moving the timestamp a waiting client is watching.
+   */
+  ack(sessionId) {
+    const rec = this.claimOf(sessionId);
+    if (!rec || rec.ackedAt) return rec;
+    rec.ackedAt = this.now();
+    const tmp = `${this.#path(sessionId)}.tmp`;
+    writeFileSync(tmp, JSON.stringify(rec));
+    renameSync(tmp, this.#path(sessionId));
+    return rec;
+  }
+
+  /** Has the daemon confirmed it let go of this session? */
+  isAcked(sessionId) { return Boolean(this.claimOf(sessionId)?.ackedAt); }
+
   release(sessionId) {
     if (!this.dir) return false;
     const p = this.#path(sessionId);
@@ -97,6 +120,15 @@ export class Handoff {
     const queue = this.parked(sessionId);
     if (queue.length) this.#drop(this.#pending(sessionId));
     return queue;
+  }
+
+  /** Every live claim, so the daemon can find out what it is being asked to let go of. */
+  claims() {
+    if (!this.dir || !existsSync(this.dir)) return [];
+    return readdirSync(this.dir)
+      .filter((f) => f.endsWith('.claim.json'))
+      .map((f) => this.claimOf(f.replace('.claim.json', '')))
+      .filter(Boolean);
   }
 
   /** Sessions whose claims have just been released, so the daemon can drain them. */

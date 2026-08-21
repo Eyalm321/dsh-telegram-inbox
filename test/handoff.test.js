@@ -77,3 +77,54 @@ test('with no directory configured the feature is simply off', () => {
   assert.deepEqual(h.releasedWithPending(), []);
   assert.doesNotThrow(() => h.park('telegram-1', {}));
 });
+
+test('a claim is not acknowledged until the daemon confirms it let go', () => {
+  const h = new Handoff(dir());
+  h.claim('s1', 'the web UI');
+  assert.equal(h.isAcked('s1'), false);
+  h.ack('s1');
+  assert.equal(h.isAcked('s1'), true);
+});
+
+test('acknowledging twice keeps the first moment, which is the one a client waits on', () => {
+  let t = 1000;
+  const h = new Handoff(dir(), { now: () => t });
+  h.claim('s1');
+  h.ack('s1');
+  const first = h.claimOf('s1').ackedAt;
+  t = 5000;
+  h.ack('s1');
+  assert.equal(h.claimOf('s1').ackedAt, first);
+});
+
+test('a session nobody claimed cannot be acknowledged', () => {
+  const h = new Handoff(dir());
+  assert.equal(h.ack('nope'), null, 'no claim, nothing to stamp');
+  assert.equal(h.isAcked('nope'), false);
+});
+
+test('the acknowledgement goes with the claim, so the next handoff waits again', () => {
+  const h = new Handoff(dir());
+  h.claim('s1'); h.ack('s1');
+  h.release('s1');
+  h.claim('s1');
+  assert.equal(h.isAcked('s1'), false);
+});
+
+test('every live claim is listed, so the daemon knows what to let go of', () => {
+  const h = new Handoff(dir());
+  h.claim('a', 'web'); h.claim('b', 'cli');
+  assert.deepEqual(h.claims().map((c) => c.sessionId).sort(), ['a', 'b']);
+});
+
+test('expired claims are not listed, so a crashed client cannot strand a chat', () => {
+  let t = 0;
+  const h = new Handoff(dir(), { ttlMs: 100, now: () => t });
+  h.claim('a');
+  t = 500;
+  assert.deepEqual(h.claims(), []);
+});
+
+test('with no handoff directory there are no claims to service', () => {
+  assert.deepEqual(new Handoff(null).claims(), []);
+});
