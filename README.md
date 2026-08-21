@@ -108,6 +108,23 @@ npm test
 No harness required: every module except the entrypoint is dependency-free, and one test
 imports the entrypoint so a syntax error cannot ship green.
 
+## Part of a set
+
+Three independent plugins, each usable on its own, that together make a headless DeepSeek
+Harness behave like a persistent assistant. They were written one problem at a time and
+share no code — the seams between them are the harness's own.
+
+| plugin | what it adds |
+|---|---|
+| **dsh-telegram-inbox** *(this one)* | a Telegram channel where one chat is one durable agent session |
+| [dsh-headless-resume](https://github.com/Eyalm321/dsh-headless-resume) | the same durability for one-shot CLI runs, keyed by a named thread |
+| [dsh-claude-cli-provider](https://github.com/Eyalm321/dsh-claude-cli-provider) | Claude on a subscription as a model route, with no Anthropic API key |
+
+Worth knowing when choosing a model for chat agents: a provider that runs its own tool loop
+(`claude -p`) cannot accept the harness's tool schemas, so a chat agent on that route has no
+harness tools. Point the default model at a native-runtime model for a bot expected to *do*
+things — see the note under **Notes** below.
+
 ## License
 
 MIT
