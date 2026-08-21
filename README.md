@@ -119,6 +119,8 @@ share no code — the seams between them are the harness's own.
 | **dsh-telegram-inbox** *(this one)* | a Telegram channel where one chat is one durable agent session |
 | [dsh-headless-resume](https://github.com/Eyalm321/dsh-headless-resume) | the same durability for one-shot CLI runs, keyed by a named thread |
 | [dsh-claude-cli-provider](https://github.com/Eyalm321/dsh-claude-cli-provider) | Claude on a subscription as a model route, with no Anthropic API key |
+| [dsh-whatsapp-inbox](https://github.com/Eyalm321/dsh-whatsapp-inbox) | WhatsApp over Twilio, polled — no public endpoint |
+| [dsh-mcp-bridge](https://github.com/Eyalm321/dsh-mcp-bridge) | harness capabilities as MCP tools for any client |
 
 Worth knowing when choosing a model for chat agents: a provider that runs its own tool loop
 (`claude -p`) cannot accept the harness's tool schemas, so a chat agent on that route has no
