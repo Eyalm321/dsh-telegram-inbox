@@ -12,6 +12,7 @@
  *
  * @module dsh-telegram-inbox/album
  */
+import { videoOf } from './media.js';
 
 export class Albums {
   /** @param {{graceMs?: number, now?: () => number}} [opts] */
@@ -52,16 +53,24 @@ export class Albums {
 }
 
 /**
- * Merge album members into a single message carrying every photo and the one caption.
- * The merged message keeps the first member's identity — chat, sender, id — so allow-list
- * and session routing behave exactly as for any other message.
+ * Merge album members into a single message carrying every photo, every clip and the one
+ * caption. The merged message keeps the first member's identity — chat, sender, id — so
+ * allow-list and session routing behave exactly as for any other message.
+ *
+ * An album is not photos-only: Telegram lets one media group hold pictures and videos
+ * together, and that is exactly how a phone sends "here is the boat and here is the fish".
+ * Collecting only the photos is how half of such a message used to disappear, so both lists
+ * are gathered and the merged message carries whichever of them are non-empty.
  */
 export function merge(messages) {
   const [first] = messages;
   const caption = messages.map((m) => (m.caption ?? '').trim()).find(Boolean) ?? '';
   const photos = [];
+  const videos = [];
   for (const m of messages) {
     if (Array.isArray(m.photo) && m.photo.length) photos.push(m.photo[m.photo.length - 1]);
+    const clip = videoOf(m);
+    if (clip) videos.push(clip);
   }
   return {
     ...first,
@@ -70,5 +79,8 @@ export function merge(messages) {
     // largest size and the array stays "ascending" from that function's point of view.
     photo: photos.length ? photos : first.photo,
     album: photos.length,
+    // Tagged with the field each came from, because a clip's field decides its default name
+    // and `document` clips are the ones with a real filename worth keeping.
+    ...(videos.length ? { videos } : {}),
   };
 }
