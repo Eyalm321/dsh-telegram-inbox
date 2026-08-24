@@ -22,7 +22,7 @@ implementation had defects that show up only in production:
 | `nudgeUntilClaimed` polls every 500ms for 120s per message | Uncancellable timers accumulate per message | Removed; wait for idle with a ceiling, then wake once |
 | Shells out to `curl` while already using `fetch` | An external binary for no reason | `fetch` |
 | Russian UI strings | The bot answers its English-speaking owner in Russian | English |
-| No tests | — | 134 |
+| No tests | — | 189 |
 
 Two behaviours are kept deliberately, because the original got them right:
 
@@ -63,6 +63,9 @@ dsh plugin --profile <name> add dsh-telegram-inbox
 | `preset` | harness default | Agent preset to mount. |
 | `provider` / `model` | from `agentDefaultModel` | Only used when no default-model service is composed. |
 | `transcribeCommand` | — | Voice transcriber. Contract: `<cmd> <audio-file> auto` → transcript on stdout. |
+| `video` | `true` | Read videos by sampling frames. `false` refuses them out loud rather than ignoring them. |
+| `videoFrames` | `6` | Frames sampled per clip. Reduced for a short clip; never more than the clip has. |
+| `ffmpegPath` / `ffprobePath` | `ffmpeg` / `ffprobe` | Overrides when they are not on the service's `PATH`. |
 | `logLevel` | `info` | `error` / `warn` / `info` / `debug`. Also `DSH_TELEGRAM_LOG_LEVEL`. |
 | `maxChats` | `32` | Live chats held before the oldest is evicted. |
 | `chatIdleMs` | 6h | Idle time before a chat is evicted. |
@@ -73,6 +76,74 @@ dsh plugin --profile <name> add dsh-telegram-inbox
 | `autoHandoff` | `true` | Let ownership follow whoever spoke last (below). `false` keeps manual claims only. |
 | `quietMs` | `0` | How long the other side must be silent before Telegram takes the chat back. `0` is immediate. |
 | `staleTurnMs` | 15m | A turn whose log has not been written to for this long is a crashed turn, not a running one. |
+
+## What it can read
+
+| Sent as | Read as |
+|---|---|
+| Text | Text |
+| Voice note or audio | Transcript, via `transcribeCommand` |
+| Photo, photo album | The largest size of each picture |
+| Image sent as a file | The document, at its real mime type |
+| **Video**, **animation** (Telegram's gif), **video note** | **`videoFrames` stills sampled across the clip** |
+| **A clip sent as a file** (`video/*` document) | **The same** |
+| **A mixed album** | **Every picture AND every clip, under the one caption** |
+| Sticker, location, contact, poll, other documents | Refused, in the chat and in the turn |
+
+### Video is read by looking at frames
+
+A model cannot watch a clip, so the honest way to read one is to look at stills from it.
+They are sampled **evenly across the whole clip**: the midpoints of *n* equal slices, so
+the spacing is constant and neither end lands on an edge frame. Sampling the first *n*
+seconds instead is what makes an agent confidently describe the sky: the opening seconds of
+a hand-held video are the ground while the phone comes up, and of a screen recording, an
+empty desktop.
+
+Each frame is attached with its position written next to it (`frame 3/6 at 0:12 of
+fishing.mp4 (1:04 long)`), so the model can answer *where* it saw something instead of only
+*that* it did. Frames are scaled to fit inside 768px on the longest side and never upscaled.
+
+`ffmpeg` and `ffprobe` do the work as ordinary async subprocesses, in a private temp
+directory that is removed on every path, including every failure.
+
+### Nothing disappears quietly
+
+This is the point of the whole path. Two videos and two images were sent on 2026-08-24; the
+two images arrived, video was on the unsupported list, and **nothing was logged or said**,
+so the agent answered as though it had seen all four, because the turn contained no evidence
+otherwise. Silence was the bug.
+
+Anything that cannot be delivered now produces **both** of:
+
+- a line in the turn content naming what was sent and not included, so the model cannot
+  mistake a partial message for a whole one, and
+- a reply in the chat naming the same thing, so the sender knows too.
+
+A caption always travels even when its attachment does not, because the caption is usually
+the actual request.
+
+The refusal says what it means. Telegram's Bot API will not serve a file over **20 MB**
+through `getFile` at all, so an oversize clip is refused *before* any network call, because a
+retry cannot ever succeed, and the reply says the size, the limit, and that retrying will
+not help. In practice 20 MB is roughly **20 seconds of 4K/60**, **1 minute of 1080p/30**, or
+**several minutes** of a compressed messenger-quality clip: a phone video of any real length
+sent at full quality will not fit. Sending it compressed, trimmed, or as a link to a file
+the agent can fetch itself are the ways through.
+
+### Bounds
+
+| Bound | Value |
+|---|---|
+| Per image | 12 MB |
+| Images per message | 12 |
+| Videos per message | 4 |
+| Frames per message (all clips together) | 12 |
+| Total attached bytes per message | 24 MB |
+| Frame longest side | 768px |
+| Minimum clip seconds per frame | 1 |
+
+Everything a bound cuts is named in the turn and in the reply. A truncated album is far more
+useful than a refused one, but only if the model is told what it is not seeing.
 
 ## Continuing a conversation somewhere else
 
@@ -124,7 +195,7 @@ future message with nobody left to answer it.
 
 ## Commands
 
-`/start`, `/help` — what the bot is. `/new` — start a fresh conversation (the old session stays
+`/start`, `/help` — what the bot is, and how a video is read. `/new` — start a fresh conversation (the old session stays
 on disk). `/status` — chats held, this chat's session id, current update offset.
 
 ## What a resumed chat carries

@@ -24,7 +24,11 @@ import { AllowList, describeIntruder } from './allowlist.js';
 import { ChatSessions } from './sessions.js';
 import { splitMessage } from './chunk.js';
 import { transcribeVoice } from './voice.js';
-import { classify, buildContent, describeSkipped, MAX_IMAGE_BYTES } from './media.js';
+import {
+  classify, buildContent, describeUnreadable, refusalReply, TELEGRAM_FILE_LIMIT_MB, VISUAL_KINDS,
+} from './media.js';
+import { sampleVideo, VIDEO_FRAMES_DEFAULT } from './video.js';
+import { attachMedia } from './attach.js';
 import { Albums } from './album.js';
 import { Generations } from './generations.js';
 import { Handoff } from './handoff.js';
@@ -292,31 +296,27 @@ export function apply(ctx, config = {}) {
     log.info(`delivered ${chars} chars${imgs ? ` + ${imgs} image(s)` : ''} to chat ${chatKey}`);
   }
 
+  const videoFrames = Number(config.videoFrames) > 0 ? Math.floor(config.videoFrames) : VIDEO_FRAMES_DEFAULT;
+  const videoEnabled = config.video !== false;
+
   /**
-   * Commit inbound images to the attachment service so the turn can reference them.
-   * Returns { attachments, skipped, why } — a failure here must degrade to caption-only,
-   * never to dropping the message.
+   * Everything visual in one message, committed to the attachment service: photos as
+   * themselves, clips as frames sampled evenly across their length. The work lives in
+   * `attach.js`; this only supplies what it needs from the running plugin.
    */
-  async function attachImages(photos) {
-    const store = ctx.get('attachments');
-    if (!store?.saveImage) return { attachments: [], skipped: photos.length, why: 'no attachment service is composed' };
-    const attachments = [];
-    let why = '';
-    for (const p of photos) {
-      try {
-        const { bytes } = await tg.downloadFile(p.fileId);
-        if (bytes.length > MAX_IMAGE_BYTES) {
-          why = `larger than the ${Math.round(MAX_IMAGE_BYTES / 1048576)}MB limit`;
-          log.warn(`skipping ${p.name}: ${bytes.length} bytes`);
-          continue;
-        }
-        attachments.push(await store.saveImage({ data: new Uint8Array(bytes), mediaType: p.mediaType, name: p.name }));
-      } catch (e) {
-        why = e?.message ?? String(e);
-        log.warn(`could not attach ${p.name}: ${why}`);
-      }
-    }
-    return { attachments, skipped: photos.length - attachments.length, why: why || 'unreadable' };
+  function attachAll(what) {
+    return attachMedia(what, {
+      store: ctx.get('attachments'),
+      download: (fileId) => tg.downloadFile(fileId),
+      sample: (video, opts) => sampleVideo(tg, video, {
+        ...opts,
+        ffmpegPath: config.ffmpegPath,
+        ffprobePath: config.ffprobePath,
+      }),
+      log,
+      videoFrames,
+      videoEnabled,
+    });
   }
 
   async function handleUpdate(update) {
@@ -358,23 +358,44 @@ export function apply(ctx, config = {}) {
         await tg.send(chatId, 'Could not transcribe that voice message. Please try again.', splitMessage);
         return;
       }
-    } else if (what.kind === 'photo') {
+    } else if (VISUAL_KINDS.has(what.kind)) {
       void tg.typing(chatId);
-      const { attachments, skipped, why } = await attachImages(what.photos);
-      const overflow = what.dropped
-        ? `[${what.dropped} further image(s) in this message were not read: only the first ${what.photos.length} are handled.]`
-        : '';
-      log.info(`received ${what.photos.length} image(s), attached ${attachments.length}`
+      const { attachments, failures, notes } = await attachAll(what);
+      const overflow = [];
+      if (what.dropped) {
+        overflow.push(`[${what.dropped} further image(s) in this message were not read: only the first ${what.photos.length} are handled.]`);
+      }
+      if (what.droppedVideos) {
+        overflow.push(`[${what.droppedVideos} further video(s) in this message were not read: only the first ${what.videos.length} are handled.]`);
+      }
+      log.info(`received ${what.photos.length} image(s) and ${what.videos.length} video(s), attached ${attachments.length} block(s)`
+             + (failures.length ? `, ${failures.length} refused` : '')
              + (what.text ? `, caption ${what.text.length} chars` : ', no caption'));
       content = buildContent({
         text: what.text, attachments,
-        note: [describeSkipped(skipped, why), overflow].filter(Boolean).join('\n'),
+        note: [...notes, describeUnreadable(failures), ...overflow].filter(Boolean).join('\n'),
       });
+      // Two audiences, two messages. The note above is what stops the agent believing it
+      // saw everything; this reply is what stops the sender believing the same.
+      if (failures.length) {
+        await tg.send(chatId, refusalReply(failures), splitMessage)
+          .catch((e) => log.error(`could not report unreadable media to chat ${chatId}: ${e?.message ?? e}`));
+      }
     } else if (what.kind === 'unsupported') {
-      // Never silent: the sender cannot tell a dropped message from a slow one.
+      // Never silent: the sender cannot tell a dropped message from a slow one, and neither
+      // can the agent, so the refusal is delivered to both of them.
       log.warn(`ignored unsupported message type: ${what.unsupported}`);
-      await tg.send(chatId, `I can't read ${what.unsupported} yet — send text, a voice note, or an image.`, splitMessage);
-      return;
+      await tg.send(chatId,
+        `I can't read ${what.unsupported} yet. Send text, a voice note, an image or a video.`, splitMessage);
+      // With no caption there is nothing to ask about, so the chat reply is the whole answer.
+      if (!what.text) return;
+      // A caption on an unreadable attachment is usually the actual request, so it still
+      // becomes a turn, carrying the fact that its attachment did not arrive with it.
+      content = buildContent({
+        text: what.text,
+        attachments: [],
+        note: describeUnreadable([{ name: what.unsupported, why: 'this channel cannot read that kind of attachment' }]),
+      });
     }
 
     if (!content && !text) return;
@@ -382,7 +403,9 @@ export function apply(ctx, config = {}) {
     if (text === '/start' || text === '/help') {
       await tg.send(chatId,
         'Agent online. Send a task as an ordinary message.\n' +
-        'Text, voice notes and images (with captions) all work.\n' +
+        'Text, voice notes, images and videos (with captions) all work.\n' +
+        `A video is read as ${videoFrames} still frames sampled evenly across it, and must be `
+        + `under ${TELEGRAM_FILE_LIMIT_MB} MB, because Telegram will not serve a larger file to a bot.\n` +
         '/new — start a fresh conversation (history is kept on disk).\n' +
         '/status — what this bot is currently holding.', splitMessage);
       return;

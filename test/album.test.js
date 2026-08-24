@@ -81,3 +81,50 @@ test('a forced flush releases a group early, so a lost straggler cannot strand i
   assert.equal(a.flush(true).length, 1);
   assert.equal(a.pendingCount, 0);
 });
+
+const videoMember = (gid, fid, caption) => ({
+  media_group_id: gid, message_id: fid, chat: { id: 1 }, from: { id: 9 },
+  video: { file_id: `${fid}-video`, duration: 12, file_size: 3_000_000 },
+  ...(caption ? { caption } : {}),
+});
+
+test('an album of photos and videos keeps BOTH, under the one caption', () => {
+  let t = 0;
+  const a = new Albums({ graceMs: 0, now: () => t });
+  const [msg] = a.accept([member('g', 1, 'caught it'), videoMember('g', 2), member('g', 3)]);
+  const what = classify(msg);
+  assert.equal(what.kind, 'media', 'a mixed album is not a photo album with the videos thrown away');
+  assert.deepEqual(what.photos.map((p) => p.fileId), ['1-big', '3-big']);
+  assert.deepEqual(what.videos.map((v) => v.fileId), ['2-video']);
+  assert.equal(what.text, 'caught it', 'one caption, wherever in the group it was written');
+});
+
+test('an album of videos only is a video message, not an empty one', () => {
+  const msg = merge([videoMember('g', 1, 'the trip'), videoMember('g', 2)]);
+  const what = classify(msg);
+  assert.equal(what.kind, 'video');
+  assert.equal(what.videos.length, 2);
+  assert.equal(what.text, 'the trip');
+  assert.equal(what.photos.length, 0);
+});
+
+test('the caption is found even when only a video member carries it', () => {
+  const msg = merge([member('g', 1), videoMember('g', 2, 'this bit'), member('g', 3)]);
+  assert.equal(msg.caption, 'this bit');
+});
+
+test('a clip sent as a document inside an album keeps its filename', () => {
+  const doc = {
+    media_group_id: 'g', message_id: 5, chat: { id: 1 }, from: { id: 9 },
+    document: { file_id: 'd', mime_type: 'video/quicktime', file_name: 'IMG_4021.MOV' },
+  };
+  const what = classify(merge([member('g', 1, 'cap'), doc]));
+  assert.equal(what.kind, 'media');
+  assert.equal(what.videos[0].name, 'IMG_4021.MOV');
+});
+
+test('a photo-only album still carries no videos key, so nothing changed for it', () => {
+  const msg = merge([member('g', 1, 'cap'), member('g', 2)]);
+  assert.equal(msg.videos, undefined);
+  assert.equal(classify(msg).kind, 'photo');
+});
