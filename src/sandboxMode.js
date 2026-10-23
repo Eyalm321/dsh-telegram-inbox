@@ -21,13 +21,14 @@
  *
  * @module dsh-headless-resume/sandboxMode
  */
+import { sessionEvents } from './sessionEvents.js';
 
 export const MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 
 /** The mode a session currently resolves to from its own events, or undefined. */
 export function foldSessionMode(session) {
-  const events = session?.events;
-  if (!Array.isArray(events)) return undefined;
+  const events = sessionEvents(session);
+  if (!events) return undefined;
   let mode;
   for (const event of events) {
     if (event?.type === 'sandbox/mode' && typeof event.data?.mode === 'string') mode = event.data.mode;

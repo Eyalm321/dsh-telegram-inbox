@@ -20,6 +20,7 @@
  *
  * @module dsh-headless-resume/staleContext
  */
+import { sessionEvents } from './sessionEvents.js';
 
 /** The plugin whose `user/message` events are runtime-context snapshots. */
 export const CONTEXT_SOURCE = '@deepseek-ai/dsh-system-prompt';
@@ -47,8 +48,8 @@ export function pruneStaleContext(session, opts = {}) {
   const marker = opts.marker ?? MARKER;
 
   const nodes = session?.surface?.nodes;
-  const events = session?.events;
-  if (!Array.isArray(events) || !nodes) {
+  const events = sessionEvents(session);
+  if (!events || !nodes) {
     // A harness that changes this shape should degrade to "no pruning", never to a
     // failed resume: a stale snapshot is a nuisance, a lost session is not.
     return { replaced: [], skipped: 'session surface unavailable' };
