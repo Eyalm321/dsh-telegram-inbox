@@ -18,6 +18,17 @@ test('a session already on disk is resumed, never recreated', async () => {
   assert.deepEqual(seen, [['resume', 'telegram-42']]);
 });
 
+test('a session listed in the dsh 0.2 snapshot shape is resumed, never recreated', async () => {
+  const seen = [];
+  const s = make();
+  await s.acquire('42', {
+    persistence: { list: async () => [{ header: { id: 'telegram-42' }, revision: 'r1' }] },
+    resume: async (id) => { seen.push(['resume', id]); return handle('r'); },
+    create: async (id) => { seen.push(['create', id]); return handle('c'); },
+  });
+  assert.deepEqual(seen, [['resume', 'telegram-42']]);
+});
+
 test('an unknown chat creates a session', async () => {
   const seen = [];
   const s = make();

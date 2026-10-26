@@ -76,7 +76,10 @@ export class ChatSessions {
 
   async #onDisk(persistence, sessionId) {
     try {
-      return (await persistence.list()).some((h) => h.id === sessionId);
+      // dsh 0.1 listed bare headers; 0.2 lists snapshots that carry the header inside.
+      // Reading only `h.id` on 0.2 found nothing, so every stored chat was "created" again
+      // and refused as already existing.
+      return (await persistence.list()).some((h) => (h.header ?? h).id === sessionId);
     } catch (e) {
       this.log.warn(`could not list stored sessions: ${e?.message ?? e}`);
       return false;
